@@ -35,8 +35,8 @@ final class DatabaseProceduralFunctionsRector extends AbstractRector
 
             $mapping = $db_procedural_functions_methods_mapping[(string) $node->name];
 
-            // Injected database.
             if ($mapping['type'] == 'injected_database') {
+                // Injected database type.
 
                 if ( in_array((string) $node->name, $needs_custom_refactoring) == FALSE ) {
                     // Custom refactoring is NOT needed.
@@ -57,6 +57,33 @@ final class DatabaseProceduralFunctionsRector extends AbstractRector
                     // Custom refactoring is needed.
                     // @todo Handle custom refactoring in injected_database type.
                 }
+            } elseif ($mapping['type'] == 'close_connection') {
+                // Close connection type.
+
+                // Check that the first argument ($options) is exists or not.
+                if (array_key_exists(0, $node->args)) {
+                    // $options argument exists.
+                    $target = $this->getTargetFromOptionArgument($node->args[0]->value);
+                    if ($target !== FALSE) {
+                        return new Node\Expr\StaticCall(new Node\Name\FullyQualified('Drupal\Core\Database\Database'), 'closeConnection', [$target]);
+                    }
+                } else {
+                    // $options argument doesn't exist.
+                    return new Node\Expr\StaticCall(new Node\Name\FullyQualified('Drupal\Core\Database\Database'), 'closeConnection');
+                }
+
+            } elseif ($mapping['type'] == 'condition') {
+                // Condition type.
+                if ( !empty($mapping['parameter']) ) {
+                    // Call Condition with parameter.
+                    return new Node\Expr\New_(new Node\Name\FullyQualified('Drupal\Core\Database\Query\Condition'), [new Node\Scalar\String_($mapping['parameter'])]);
+                } else {
+                    // Call Condition with the inherited parameter.
+                    return new Node\Expr\New_(new Node\Name\FullyQualified('Drupal\Core\Database\Query\Condition'), $node->args);
+                }
+            } elseif ($mapping['type'] == 'set_active_connection') {
+                // Set active connection type.
+                return new Node\Expr\StaticCall(new Node\Name\FullyQualified('Drupal\Core\Database\Database'), 'setActiveConnection', $node->args);
             }
         }
 
@@ -68,6 +95,31 @@ final class DatabaseProceduralFunctionsRector extends AbstractRector
     public function getDefinition(): RectorDefinition
     {
         return new RectorDefinition(sprintf('Fixes deprecated db_* procedural function calls of the Database API layer'));
+    }
+
+    /**
+     * Get target from options argument.
+     *
+     * @param $arg
+     *
+     * @return bool|\PhpParser\Node\Expr|\PhpParser\Node\Identifier
+     */
+    private function getTargetFromOptionArgument($arg) {
+        $target = FALSE;
+        if ($arg instanceof Node\Expr\Array_) {
+            // If the $option parameter is an array.
+            $target = new Node\Identifier('NULL');
+
+            foreach ($arg->items as $array_item) {
+                if ( $array_item->key instanceof Node\Scalar\String_ && $array_item->key->value == 'target') {
+                    $target = $array_item->value;
+                }
+            }
+        } else  {
+            // Unable to identify type of $options, because it coming from a variable or such.
+            // @todo Research how this situation can be handled.
+        }
+        return $target;
     }
 
     /**
