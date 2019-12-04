@@ -43,19 +43,84 @@ final class DatabaseProceduralFunctionsRector extends AbstractRector
                     // Call the default database
                     $new_node = new Node\Expr\StaticCall(new Node\Name\FullyQualified('Drupal'), 'service', [new Node\Scalar\String_('database')]);
                     // Add methods.
-                    for($i = 0; $i < count($mapping['methods']); $i++) {
-                        if ($i == count($mapping['methods']) - 1) {
-                            // If this is the last method.
-                            $new_node = new Node\Expr\MethodCall($new_node, new Node\Identifier($mapping['methods'][$i]), $node->args);
-                        } else {
-                            // If this is NOT the last method.
-                            $new_node = new Node\Expr\MethodCall($new_node, new Node\Identifier($mapping['methods'][$i]));
-                        }
-                    }
+                    $new_node = $this->addMethods($new_node, $node->args, $mapping);
                     return $new_node;
                 } else {
                     // Custom refactoring is needed.
                     // @todo Handle custom refactoring in injected_database type.
+                    if ( (string) $node->name == 'db_delete' ) {
+                        if (array_key_exists(1, $node->args)) {
+                            // If the $options argument exists.
+
+                            // Get 'target' from $options argument.
+                            $target = $this->getTargetFromOptionsArgument($node->args[1]->value);
+                            if (($target instanceof Node\Scalar\String_ && ($target->value === 'default' || $target->value === 'replica')) || ($target instanceof Node\Identifier && $target->name === 'NULL')) {
+                                // Target is 'default' or 'replica' or NULL.
+                                // Call the default database service.
+                                $new_node = new Node\Expr\StaticCall(new Node\Name\FullyQualified('Drupal'), 'service', [new Node\Scalar\String_('database')]);
+                                // Set the 'target' key to be 'default' in the $options argument.
+                                $node->args[1]->value = $this->setTargetInOptionsArgument($node->args[1]->value, 'default');
+                            } elseif ($target instanceof Node\Scalar\String_) {
+                                // Target is string, but not 'default' or 'replica'
+                                $new_node = new Node\Expr\StaticCall(new Node\Name\FullyQualified('Drupal\Core\Database\Database'), 'getConnection', [$target]);
+                            } else {
+                                // Target is unknown.
+                                $new_variable = new Node\Expr\Assign(new Node\Expr\Variable('_db_options'), $node->args[1]->value);
+                                $this->addNodeAfterNode($new_variable, $node);
+                                /**
+                                 * Add this:
+                                 * @see https://api.drupal.org/api/drupal/core%21includes%21database.inc/function/db_delete/8.7.x
+                                 *
+                                 * if (empty($_db_options['target']) || $_db_options['target'] == 'replica') {
+                                 *   $_db_options['target'] = 'default';
+                                 * }
+                                 */
+                                // @todo After the statement the semicolon is missing. Find out why.
+                                $if_expression = new Node\Stmt\If_(
+                                    // Conditions.
+                                    new Node\Expr\BinaryOp\BooleanOr(
+                                        // Left.
+                                        new Node\Expr\Empty_(new Node\Expr\ArrayDimFetch(new Node\Expr\Variable('_db_options'), new Node\Scalar\String_('target'))),
+                                        // Right.
+                                        new Node\Expr\BinaryOp\Equal(
+                                            // Left.
+                                            new Node\Expr\ArrayDimFetch(new Node\Expr\Variable('_db_options'), new Node\Scalar\String_('target')),
+                                            // Right.
+                                            new Node\Scalar\String_('replica')
+                                        )
+                                    ),
+                                    // If's subnodes.
+                                    [
+                                        // Statements.
+                                        'stmts' => [new Node\Expr\Assign(new Node\Expr\ArrayDimFetch(new Node\Expr\Variable('_db_options'), new Node\Scalar\String_('target')), new Node\Scalar\String_('default'))]
+                                    ]
+                                );
+                                $this->addNodeAfterNode($if_expression, $node);
+                                // Add this: Database::getConnection($_db_options['target'])->delete($table, $_db_options);
+                                $new_node = new Node\Expr\StaticCall(new Node\Name\FullyQualified('Drupal\Core\Database\Database'), 'getConnection', [
+                                    new Node\Expr\ArrayDimFetch(new Node\Expr\Variable('_db_options'), new Node\Scalar\String_('target'))
+                                ]);
+                                // Update the second argument.
+                                $node->args[1]->value = new Node\Expr\Variable('_db_options');
+                                $new_node = $this->addMethods($new_node, $node->args, $mapping);
+                                $this->addNodeAfterNode($new_node, $node);
+                                $this->removeNode($node);
+                                return $node;
+                            }
+
+                            // Add methods.
+                            $new_node = $this->addMethods($new_node, $node->args, $mapping);
+                            return $new_node;
+                        } else {
+                            // If the $options argument doesn't exist.
+
+                            // Call the default database
+                            $new_node = new Node\Expr\StaticCall(new Node\Name\FullyQualified('Drupal'), 'service', [new Node\Scalar\String_('database')]);
+                            // Add methods.
+                            $new_node = $this->addMethods($new_node, $node->args, $mapping);
+                            return $new_node;
+                        }
+                    }
                 }
             } elseif ($mapping['type'] == 'close_connection') {
                 // Close connection type.
@@ -63,7 +128,7 @@ final class DatabaseProceduralFunctionsRector extends AbstractRector
                 // Check that the first argument ($options) is exists or not.
                 if (array_key_exists(0, $node->args)) {
                     // $options argument exists.
-                    $target = $this->getTargetFromOptionArgument($node->args[0]->value);
+                    $target = $this->getTargetFromOptionsArgument($node->args[0]->value);
                     if ($target !== FALSE) {
                         return new Node\Expr\StaticCall(new Node\Name\FullyQualified('Drupal\Core\Database\Database'), 'closeConnection', [$target]);
                     }
@@ -98,13 +163,55 @@ final class DatabaseProceduralFunctionsRector extends AbstractRector
     }
 
     /**
+     * Add methods.
+     *
+     * @param $new_node
+     * @param $args
+     * @param $mapping
+     *
+     * @return \PhpParser\Node\Expr\MethodCall
+     */
+    private function addMethods($new_node, $args, $mapping) {
+        for($i = 0; $i < count($mapping['methods']); $i++) {
+            if ($i == count($mapping['methods']) - 1) {
+                // If this is the last method.
+                $new_node = new Node\Expr\MethodCall($new_node, new Node\Identifier($mapping['methods'][$i]), $args);
+            } else {
+                // If this is NOT the last method.
+                $new_node = new Node\Expr\MethodCall($new_node, new Node\Identifier($mapping['methods'][$i]));
+            }
+        }
+        return $new_node;
+    }
+
+    /**
+     * Set target in $options argument.
+     *
+     * @param $arg
+     * @param $target
+     *
+     * @return \PhpParser\Node\Expr\
+     */
+    private function setTargetInOptionsArgument($arg, $target) {;
+        if ($arg instanceof Node\Expr\Array_) {
+
+            foreach ($arg->items as $key => $array_item) {
+                if ( $array_item->key instanceof Node\Scalar\String_ && $array_item->key->value == 'target') {
+                    $arg->items[$key]->value = new Node\Scalar\String_($target);
+                }
+            }
+        }
+        return $arg;
+    }
+
+    /**
      * Get target from options argument.
      *
      * @param $arg
      *
      * @return bool|\PhpParser\Node\Expr|\PhpParser\Node\Identifier
      */
-    private function getTargetFromOptionArgument($arg) {
+    private function getTargetFromOptionsArgument($arg) {
         $target = FALSE;
         if ($arg instanceof Node\Expr\Array_) {
             // If the $option parameter is an array.
